@@ -13,20 +13,10 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { deleteImageTag, deleteManagedImages, downloadImages, downloadSingleImage, fetchImageTags, fetchManagedImages, setImageTags, type ManagedImage } from "@/lib/api";
+import { compressAllImages, deleteImageTag, deleteManagedImages, deleteToTarget, downloadImages, downloadSingleImage, fetchImageStorage, fetchImageTags, fetchManagedImages, setImageTags, type ImageStorageStats, type ManagedImage } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
-
-function storageBadge(item: ManagedImage) {
-  if (item.local && item.webdav) {
-    return { label: "双端", className: "border-sky-200 bg-sky-50 text-sky-700" };
-  }
-  if (item.webdav || item.storage === "webdav") {
-    return { label: "WebDAV", className: "border-violet-200 bg-violet-50 text-violet-700" };
-  }
-  return { label: "本机", className: "border-stone-200 bg-stone-50 text-stone-600" };
-}
 
 function formatSize(size: number) {
   return size > 1024 * 1024 ? `${(size / 1024 / 1024).toFixed(2)} MB` : `${Math.ceil(size / 1024)} KB`;
@@ -74,16 +64,32 @@ function ImageManagerContent() {
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [page, setPage] = useState(1);
   const [isLoading, setIsLoading] = useState(true);
+  const [deleteStartDate, setDeleteStartDate] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<ManagedImage | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [allTags, setAllTags] = useState<string[]>([]);
+  const [storage, setStorage] = useState<ImageStorageStats | null>(null);
+  const [storageLoading, setStorageLoading] = useState(false);
+  const [compressResult, setCompressResult] = useState<string>("");
+  const [targetFreeMb, setTargetFreeMb] = useState(500);
+
+  const loadStorage = useCallback(async () => {
+    try {
+      setStorageLoading(true);
+      const data = await fetchImageStorage();
+      setStorage(data);
+    } catch { /* ignore */ }
+    finally { setStorageLoading(false); }
+  }, []);
+
+  useEffect(() => { void loadStorage(); }, [loadStorage]);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [tagEditTarget, setTagEditTarget] = useState<ManagedImage | null>(null);
   const [tagInput, setTagInput] = useState("");
   const [dialogVisible, setDialogVisible] = useState(false);
   const deleteTargetRef = useRef<ManagedImage | null>(null);
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
-  const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | null>(null);
+  const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | "byDate" | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
 
   const filteredItems = selectedTags.length > 0
@@ -101,7 +107,7 @@ function ImageManagerContent() {
   const safePage = Math.min(page, pageCount);
   const currentRows = filteredItems.slice((safePage - 1) * pageSize, safePage * pageSize);
   const selectedSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
-  const selectedCount = deleteMode === "filtered" ? items.length : selectedPaths.length;
+  const selectedCount = deleteMode === "filtered" ? items.length : deleteMode === "byDate" ? 0 : selectedPaths.length;
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(imageKey(item)));
   const allSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedSet.has(imageKey(item)));
 
@@ -336,6 +342,100 @@ function ImageManagerContent() {
         </div>
       ) : null}
 
+      {/* Storage Stats Panel */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3 mb-4">
+        {storage ? (
+          <>
+            <div className="rounded-xl border border-stone-200 bg-white/80 p-3">
+              <div className="text-xs text-stone-500">磁盘总量</div>
+              <div className="text-lg font-bold text-stone-800">{storage.disk_total_mb >= 1024 ? `${(storage.disk_total_mb / 1024).toFixed(1)} GB` : `${storage.disk_total_mb} MB`}</div>
+            </div>
+            <div className="rounded-xl border border-stone-200 bg-white/80 p-3">
+              <div className="text-xs text-stone-500">剩余空间</div>
+              <div className={`text-lg font-bold ${storage.disk_free_mb < 200 ? "text-red-500" : storage.disk_free_mb < 500 ? "text-yellow-500" : "text-green-600"}`}>{storage.disk_free_mb >= 1024 ? `${(storage.disk_free_mb / 1024).toFixed(1)} GB` : `${storage.disk_free_mb} MB`}</div>
+            </div>
+            <div className="rounded-xl border border-stone-200 bg-white/80 p-3">
+              <div className="text-xs text-stone-500">图片数量</div>
+              <div className="text-lg font-bold text-stone-800">{storage.image_count}</div>
+            </div>
+            <div className="rounded-xl border border-stone-200 bg-white/80 p-3">
+              <div className="text-xs text-stone-500">图片占用</div>
+              <div className="text-lg font-bold text-stone-800">{storage.image_size_mb >= 1024 ? `${(storage.image_size_mb / 1024).toFixed(1)} GB` : `${storage.image_size_mb} MB`}</div>
+            </div>
+            <div className="rounded-xl border border-stone-200 bg-white/80 p-3 col-span-2 flex items-center gap-2 flex-wrap">
+              <span className="text-xs text-stone-500 w-full">快捷操作</span>
+              <Button size="sm" variant="outline" className="h-7 text-xs" disabled={storageLoading} onClick={() => { void loadStorage(); }}>
+                <RefreshCw className={`size-3 mr-1 ${storageLoading ? "animate-spin" : ""}`} />刷新
+              </Button>
+              <Button size="sm" variant="outline" className="h-7 text-xs"
+                onClick={async () => {
+                  try { const r = await compressAllImages(); setCompressResult(`已压缩${r.saved_mb}MB`); void loadStorage(); }
+                  catch { setCompressResult("压缩失败"); }
+                }}>
+                🗜️ 压缩优化
+              </Button>
+              <Button size="sm" variant="outline" className="h-7 text-xs border-rose-200 text-rose-600"
+                onClick={() => setDeleteMode("byDate")}>
+                🗑️ 按日期删除
+              </Button>
+              <form onSubmit={async (e) => { e.preventDefault();
+                try {
+                  const r = await deleteToTarget(targetFreeMb);
+                  toast.success(`已删除 ${r.removed} 张图片，释放 ${r.freed_mb}MB`);
+                  void loadStorage();
+                } catch { toast.error("清理失败"); }
+              }} className="flex items-center gap-1">
+                <Button size="sm" variant="outline" className="h-7 text-xs border-amber-200 text-amber-700" type="submit">
+                  🧹 清理至
+                </Button>
+                <Input className="h-7 w-14 text-xs text-center px-1" type="number" min={50} value={targetFreeMb}
+                  onChange={(e) => setTargetFreeMb(Number(e.target.value) || 500)} />
+                <span className="text-xs text-stone-400">MB 剩余</span>
+              </form>
+              {compressResult ? <span className="text-xs text-green-600 ml-1">{compressResult}</span> : null}
+            </div>
+          </>
+        ) : (
+          <div className="rounded-xl border border-stone-200 bg-white/80 p-3 col-span-full text-center text-sm text-stone-400">
+            {storageLoading ? "加载存储信息..." : "存储信息加载失败"}
+          </div>
+        )}
+      </div>
+
+      {/* Delete by date dialog */}
+      <Dialog open={deleteMode === "byDate"} onOpenChange={() => setDeleteMode(null)}>
+        <DialogContent className="sm:max-w-md rounded-2xl">
+          <DialogHeader><DialogTitle>按日期删除图片</DialogTitle></DialogHeader>
+          <div className="space-y-4">
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-stone-600 shrink-0">删除</label>
+              <Input className="h-9 text-sm" type="date" value={deleteStartDate} onChange={(e) => setDeleteStartDate(e.target.value)} />
+              <span className="text-sm text-stone-400">之前的图片</span>
+            </div>
+            <p className="text-xs text-stone-500">此操作不可撤销，将永久删除所有匹配日期的图片及其缩略图。</p>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setDeleteMode(null)}>取消</Button>
+            <Button variant="destructive" disabled={!deleteStartDate || isDeleting}
+              onClick={async () => {
+                if (!deleteStartDate) return;
+                try {
+                  setIsDeleting(true);
+                  const r = await deleteManagedImages({ end_date: deleteStartDate, all_matching: true });
+                  toast.success(`已删除 ${r.removed} 张图片`);
+                  setDeleteMode(null);
+                  void loadStorage();
+                  void loadImages();
+                } catch { toast.error("删除失败"); }
+                finally { setIsDeleting(false); }
+              }}>
+              {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+              确认删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
         <CardContent className="p-0">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
@@ -374,7 +474,6 @@ function ImageManagerContent() {
           <div className="grid gap-0 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {currentRows.map((item) => {
               const imageIndex = filteredItems.findIndex((row) => row.url === item.url);
-              const storage = storageBadge(item);
               return (
               <div key={item.rel} className="group border-r border-b border-stone-100 p-4 transition hover:bg-stone-50">
                 <div className="relative">
@@ -398,9 +497,6 @@ function ImageManagerContent() {
                     />
                     <span className="absolute right-2 bottom-2 rounded-full bg-black/50 p-2 text-white opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
                       <Maximize2 className="size-4" />
-                    </span>
-                    <span className={`absolute top-2 left-2 rounded-md border px-2 py-1 text-[10px] font-medium ${storage.className}`}>
-                      {storage.label}
                     </span>
                   </button>
                   <button
@@ -447,12 +543,7 @@ function ImageManagerContent() {
                   </div>
                   <div className="flex items-center justify-between gap-2">
                     <span>{formatSize(item.size)}</span>
-                    <span className="inline-flex items-center gap-2">
-                      <Badge variant="outline" className={`rounded-md px-2 py-0 text-[10px] ${storage.className}`}>
-                        {storage.label}
-                      </Badge>
-                      {item.width && item.height ? `${item.width} x ${item.height}` : "-"}
-                    </span>
+                    <span>{item.width && item.height ? `${item.width} x ${item.height}` : "-"}</span>
                   </div>
                   <div className="flex flex-wrap items-center gap-1">
                     {(item.tags ?? []).map((tag) => (
@@ -583,7 +674,7 @@ function ImageManagerContent() {
         onOpenChange={setLightboxOpen}
         onIndexChange={setLightboxIndex}
       />
-      <Dialog open={Boolean(deleteMode)} onOpenChange={(open) => (!open ? setDeleteMode(null) : null)}>
+      <Dialog open={deleteMode === "selected" || deleteMode === "filtered"} onOpenChange={(open) => (!open ? setDeleteMode(null) : null)}>
         <DialogContent showCloseButton={false} className="rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>{deleteMode === "filtered" ? "删除匹配日期的图片" : "删除所选图片"}</DialogTitle>
