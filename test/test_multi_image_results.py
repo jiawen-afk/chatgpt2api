@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import queue
 import unittest
 from unittest import mock
+
+from curl_cffi.requests.models import STREAM_END
 
 from services.config import config
 from services.openai_backend_api import ImagePollTimeoutError, OpenAIBackendAPI
@@ -11,9 +14,16 @@ from services.protocol.conversation import (
     ImageOutput,
     _generate_single_image,
     extract_conversation_ids,
+    is_tls_connection_error,
     stream_image_outputs,
 )
 from services.protocol.openai_v1_response import stream_image_response
+from utils.helper import iter_sse_payloads
+
+
+PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lm2C6wAAAABJRU5ErkJggg=="
+)
 
 
 def _conversation(file_ids: list[str], sediment_ids: list[str] | None = None) -> dict:
@@ -43,15 +53,20 @@ class FakeBackend(OpenAIBackendAPI):
         self.file_urls: dict[str, str] = {}
         self.sediment_urls: dict[str, str] = {}
 
-    def _get_conversation(self, conversation_id: str) -> dict:
+    def _get_conversation(self, conversation_id: str, timeout_secs: float = 60.0) -> dict:
         self.calls += 1
         index = min(self.calls - 1, len(self.conversations) - 1)
         return self.conversations[index]
 
-    def _get_file_download_url(self, file_id: str) -> str:
+    def _get_file_download_url(self, file_id: str, timeout_secs: float = 60.0) -> str:
         return self.file_urls.get(file_id, "")
 
-    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
+    def _get_attachment_download_url(
+        self,
+        conversation_id: str,
+        attachment_id: str,
+        timeout_secs: float = 60.0,
+    ) -> str:
         return self.sediment_urls.get(attachment_id, "")
 
 
@@ -67,6 +82,11 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertEqual(conversation_id, "conv-1")
         self.assertEqual(file_ids, ["file-first_123-extra"])
         self.assertEqual(sediment_ids, ["sed-second_456-extra"])
+
+    def test_http2_internal_error_is_treated_as_retryable_stream_error(self) -> None:
+        message = "curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR (err 2)"
+
+        self.assertTrue(is_tls_connection_error(message))
 
     def test_conversation_record_extractor_finds_all_generated_assets(self) -> None:
         backend = FakeBackend()
@@ -221,6 +241,121 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual(backend.session.post.call_args.kwargs["timeout"], 11)
 
+    def test_image_prepare_request_uses_remaining_deadline(self) -> None:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.test"
+        backend.image_request_deadline = 105.0
+        backend.session = mock.Mock()
+        backend.session.post.return_value.status_code = 200
+        backend.session.post.return_value.json.return_value = {"conduit_token": "conduit"}
+        backend._image_headers = mock.Mock(return_value={})
+        requirements = mock.Mock(token="token", proof_token="", turnstile_token="", so_token="")
+
+        with mock.patch("services.openai_backend_api.time.monotonic", return_value=100.0):
+            token = backend._prepare_image_conversation("draw", requirements, "gpt-image-2")
+
+        self.assertEqual(token, "conduit")
+        self.assertEqual(backend.session.post.call_args.kwargs["timeout"], 5.0)
+
+    def test_image_upload_requests_use_remaining_deadline(self) -> None:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.test"
+        backend.user_agent = "ua"
+        backend.image_request_deadline = 105.0
+        backend.session = mock.Mock()
+        backend._headers = mock.Mock(return_value={})
+        create_response = mock.Mock(status_code=200)
+        create_response.json.return_value = {"file_id": "file-1", "upload_url": "https://upload.test/blob"}
+        uploaded_response = mock.Mock(status_code=200)
+        put_response = mock.Mock(status_code=200)
+        backend.session.post.side_effect = [create_response, uploaded_response]
+        backend.session.put.return_value = put_response
+
+        with mock.patch("services.openai_backend_api.time.monotonic", return_value=100.0):
+            meta = backend._upload_image(f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}")
+
+        self.assertEqual(meta["file_id"], "file-1")
+        self.assertEqual([call.kwargs["timeout"] for call in backend.session.post.call_args_list], [5.0, 5.0])
+        self.assertEqual(backend.session.put.call_args.kwargs["timeout"], 5.0)
+
+    def test_chat_requirements_keep_default_timeouts_without_image_deadline(self) -> None:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.test"
+        backend.access_token = "token"
+        backend.user_agent = "ua"
+        backend.pow_script_sources = []
+        backend.pow_data_build = ""
+        backend.session = mock.Mock()
+        backend._headers = mock.Mock(return_value={})
+        prepare_response = mock.Mock(status_code=200)
+        prepare_response.json.return_value = {"prepare_token": "prepare"}
+        finalize_response = mock.Mock(status_code=200)
+        finalize_response.json.return_value = {"token": "requirements"}
+        backend.session.post.side_effect = [prepare_response, finalize_response]
+
+        with mock.patch.dict(config.data, {"image_poll_timeout_secs": 7}):
+            requirements = backend._get_chat_requirements()
+
+        self.assertEqual(requirements.token, "requirements")
+        self.assertEqual([call.kwargs["timeout"] for call in backend.session.post.call_args_list], [30.0, 30.0])
+
+    def test_poll_image_results_caps_conversation_fetch_to_remaining_budget(self) -> None:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.test"
+        backend.session = mock.Mock()
+        backend._headers = mock.Mock(return_value={})
+        backend._query_backend_tasks = mock.Mock(return_value=[])
+        response = mock.Mock(status_code=200)
+        response.json.return_value = _conversation(["file-result"])
+        backend.session.get.return_value = response
+
+        with (
+            mock.patch.dict(config.data, {
+                "image_poll_initial_wait_secs": 0,
+                "image_check_before_hit_enabled": False,
+            }),
+            mock.patch("services.openai_backend_api.time.time", side_effect=[100.0, 100.0, 101.0, 101.0]),
+        ):
+            file_ids, sediment_ids = backend._poll_image_results("conv-1", timeout_secs=5.0)
+
+        self.assertEqual(file_ids, ["file-result"])
+        self.assertEqual(sediment_ids, [])
+        self.assertEqual(backend.session.get.call_args.kwargs["timeout"], 4.0)
+
+    def test_image_download_uses_remaining_deadline(self) -> None:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.image_request_deadline = 105.0
+        backend.session = mock.Mock()
+        response = mock.Mock(status_code=200, content=b"image")
+        backend.session.get.return_value = response
+
+        with mock.patch("services.openai_backend_api.time.monotonic", return_value=100.0):
+            images = backend.download_image_bytes(["https://download.test/image.png"])
+
+        self.assertEqual(images, [b"image"])
+        self.assertEqual(backend.session.get.call_args.kwargs["timeout"], 5.0)
+
+    def test_picture_conversation_passes_deadline_to_sse_payload_iterator(self) -> None:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.access_token = "token"
+        backend.image_request_deadline = 123.0
+        backend.progress_callback = None
+        backend._upload_image = mock.Mock()
+        backend._bootstrap = mock.Mock()
+        backend._get_chat_requirements = mock.Mock(return_value=mock.Mock(token="token", proof_token="", turnstile_token="", so_token=""))
+        backend._prepare_image_conversation = mock.Mock(return_value="conduit")
+        response = mock.Mock()
+        response._stream_closed = False
+        response.close = mock.Mock()
+        backend._start_image_generation = mock.Mock(return_value=response)
+
+        with mock.patch("services.openai_backend_api.iter_sse_payloads", return_value=iter(["[DONE]"])) as iter_payloads:
+            list(backend._stream_picture_conversation("draw", "gpt-image-2", []))
+
+        self.assertEqual(iter_payloads.call_args.kwargs["deadline"], 123.0)
+        self.assertIn("ChatGPT 生图超时", iter_payloads.call_args.kwargs["timeout_message"])
+        response.close.assert_called_once()
+
     def test_image_poll_timeout_retry_stops_when_configured_budget_is_exhausted(self) -> None:
         backend = mock.Mock()
         backend.image_request_deadline = None
@@ -243,6 +378,36 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual(get_token.call_count, 1)
         self.assertEqual(backend.image_request_deadline, 101.0)
+
+    def test_sse_payload_iterator_enforces_application_deadline_for_idle_curl_stream(self) -> None:
+        response = mock.Mock()
+        response.queue = queue.Queue()
+        response.quit_now = mock.Mock()
+        response.quit_now.set = mock.Mock()
+        response._stream_closed = False
+        response.iter_lines.side_effect = AssertionError("deadline path should not use blocking iter_lines")
+
+        with mock.patch("utils.helper.time.monotonic", side_effect=[100.0, 100.6]):
+            with self.assertRaises(TimeoutError):
+                list(iter_sse_payloads(response, deadline=100.5, timeout_message="image stream timed out"))
+
+        response.quit_now.set.assert_called_once()
+        self.assertTrue(response._stream_closed)
+
+    def test_sse_payload_iterator_preserves_line_parsing_with_deadline_queue(self) -> None:
+        response = mock.Mock()
+        response.queue = queue.Queue()
+        response.quit_now = mock.Mock()
+        response._stream_closed = False
+        response.iter_lines.side_effect = AssertionError("deadline path should not use blocking iter_lines")
+        response.queue.put(b"data: one\n\ndata: t")
+        response.queue.put(b"wo\n\n")
+        response.queue.put(STREAM_END)
+
+        with mock.patch("utils.helper.time.monotonic", side_effect=[100.0, 100.0, 100.0]):
+            payloads = list(iter_sse_payloads(response, deadline=101.0))
+
+        self.assertEqual(payloads, ["one", "two"])
 
 
 if __name__ == "__main__":

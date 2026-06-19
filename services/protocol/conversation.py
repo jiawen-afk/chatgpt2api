@@ -88,6 +88,8 @@ def is_tls_connection_error(message: str) -> bool:
         or "connection aborted" in text
         or "remote disconnected" in text
         or "connection reset by peer" in text
+        or "curl: (92)" in text
+        or ("http/2 stream" in text and "internal_error" in text)
     )
 
 

@@ -201,7 +201,7 @@ class OpenAIBackendAPI:
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
-    def _image_request_timeout_secs(self) -> float:
+    def _deadline_timeout_secs(self, default_secs: float) -> float:
         deadline = getattr(self, "image_request_deadline", None)
         if deadline is not None:
             try:
@@ -209,7 +209,23 @@ class OpenAIBackendAPI:
                 return max(1.0, remaining)
             except (TypeError, ValueError):
                 pass
-        return float(config.image_poll_timeout_secs)
+        return float(default_secs)
+
+    def _image_request_timeout_secs(self) -> float:
+        return self._deadline_timeout_secs(float(config.image_poll_timeout_secs))
+
+    def _image_timeout_message(self) -> str:
+        return (
+            f"ChatGPT 生图超时（已等待 {config.image_poll_timeout_secs} 秒）。"
+            f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
+            f"也可能是账号被限流或生图队列拥堵导致。"
+        )
+
+    @staticmethod
+    def _close_stream_response(response: Any) -> None:
+        if getattr(response, "_stream_closed", False):
+            return
+        response.close()
 
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
@@ -665,10 +681,24 @@ class OpenAIBackendAPI:
             },
         })
 
-    @staticmethod
-    def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:
+    def _read_codex_response_text(self, raw: Any) -> str:
+        deadline = getattr(self, "image_request_deadline", None)
+        if deadline is None:
+            return raw.read().decode("utf-8", "replace")
+        chunks: list[bytes] = []
+        while True:
+            remaining = float(deadline) - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(self._image_timeout_message())
+            chunk = raw.read(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", "replace")
+
+    def _iter_codex_response_events(self, raw: Any) -> Iterator[Dict[str, Any]]:
         content_type = str(raw.headers.get("content-type") or "").lower()
-        text = raw.read().decode("utf-8", "replace")
+        text = self._read_codex_response_text(raw)
         status_code = getattr(raw, "status", None)
         parse_errors: list[str] = []
         events: list[Dict[str, Any]] = []
@@ -838,7 +868,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements),
             json=payload,
-            timeout=60,
+            timeout=self._deadline_timeout_secs(60),
         )
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
@@ -880,7 +910,7 @@ class OpenAIBackendAPI:
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
                   "height": height},
-            timeout=60,
+            timeout=self._deadline_timeout_secs(60),
         )
         ensure_ok(response, path)
         upload_meta = response.json()
@@ -897,7 +927,7 @@ class OpenAIBackendAPI:
                 "Accept-Language": "en-US,en;q=0.8",
             },
             data=data,
-            timeout=120,
+            timeout=self._deadline_timeout_secs(120),
         )
         ensure_ok(response, "image_upload")
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
@@ -905,7 +935,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             data="{}",
-            timeout=60,
+            timeout=self._deadline_timeout_secs(60),
         )
         ensure_ok(response, path)
         return {
@@ -990,11 +1020,11 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response
 
-    def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
+    def _get_conversation(self, conversation_id: str, timeout_secs: float = 60.0) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=timeout_secs)
         ensure_ok(response, path)
         return response.json()
 
@@ -2135,7 +2165,10 @@ class OpenAIBackendAPI:
             # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
             last_task_error = ""
             try:
-                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+                tasks = self._query_backend_tasks(
+                    conversation_id=conversation_id,
+                    timeout_secs=min(5.0, max(0.001, _remaining())),
+                )
                 for task in tasks:
                     is_error, error_msg, metadata = self.check_task_error(task)
                     if is_error and error_msg:
@@ -2157,7 +2190,10 @@ class OpenAIBackendAPI:
                 })
 
             try:
-                conversation = self._get_conversation(conversation_id)
+                conversation = self._get_conversation(
+                    conversation_id,
+                    timeout_secs=min(60.0, max(0.001, _remaining())),
+                )
             except UpstreamHTTPError as exc:
                 if exc.status_code in (429, 500, 502, 503, 504):
                     if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
@@ -2243,20 +2279,25 @@ class OpenAIBackendAPI:
         setattr(exc, "conversation_id", conversation_id or "")
         raise exc
 
-    def _get_file_download_url(self, file_id: str) -> str:
+    def _get_file_download_url(self, file_id: str, timeout_secs: float = 60.0) -> str:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=timeout_secs)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
 
-    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
+    def _get_attachment_download_url(
+        self,
+        conversation_id: str,
+        attachment_id: str,
+        timeout_secs: float = 60.0,
+    ) -> str:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=timeout_secs)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2347,7 +2388,7 @@ class OpenAIBackendAPI:
                 })
                 continue
             try:
-                url = self._get_file_download_url(file_id)
+                url = self._get_file_download_url(file_id, timeout_secs=self._deadline_timeout_secs(60))
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2378,7 +2419,11 @@ class OpenAIBackendAPI:
             return urls
         for sediment_id in sediment_ids:
             try:
-                url = self._get_attachment_download_url(conversation_id, sediment_id)
+                url = self._get_attachment_download_url(
+                    conversation_id,
+                    sediment_id,
+                    timeout_secs=self._deadline_timeout_secs(60),
+                )
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2476,7 +2521,7 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         for url in urls:
-            response = self.session.get(url, timeout=120)
+            response = self.session.get(url, timeout=self._deadline_timeout_secs(120))
             ensure_ok(response, "image_download")
             if response.content not in images:
                 images.append(response.content)
@@ -2541,16 +2586,20 @@ class OpenAIBackendAPI:
         response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
         self._report_progress("generating")
         try:
-            yield from iter_sse_payloads(response)
+            yield from iter_sse_payloads(
+                response,
+                deadline=getattr(self, "image_request_deadline", None),
+                timeout_message=self._image_timeout_message(),
+            )
         finally:
-            response.close()
+            self._close_stream_response(response)
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
-            timeout=30,
+            timeout=self._deadline_timeout_secs(30),
         )
         ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
@@ -2567,7 +2616,7 @@ class OpenAIBackendAPI:
             self.base_url + prepare_path,
             headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
             json={"p": p_token},
-            timeout=30,
+            timeout=self._deadline_timeout_secs(30),
         )
         ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
@@ -2600,7 +2649,7 @@ class OpenAIBackendAPI:
                 "proof_token": proof_token,
                 "turnstile_token": turnstile_token,
             },
-            timeout=30,
+            timeout=self._deadline_timeout_secs(30),
         )
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()
