@@ -114,6 +114,28 @@ def image_stream_error_message(message: str) -> str:
     return text or "image generation failed"
 
 
+def _image_remaining_timeout_secs(backend: object) -> float:
+    deadline = getattr(backend, "image_request_deadline", None)
+    if deadline is not None:
+        try:
+            return max(0.0, float(deadline) - time.monotonic())
+        except (TypeError, ValueError):
+            pass
+    return float(config.image_poll_timeout_secs)
+
+
+def _sleep_image_retry(backend: object, seconds: float) -> None:
+    sleep_for = min(max(0.0, seconds), _image_remaining_timeout_secs(backend))
+    if sleep_for > 0:
+        time.sleep(sleep_for)
+
+
+def _sleep_until_deadline(deadline: float, seconds: float) -> None:
+    sleep_for = min(max(0.0, seconds), max(0.0, deadline - time.monotonic()))
+    if sleep_for > 0:
+        time.sleep(sleep_for)
+
+
 REFERENCED_IMAGE_IDS_RE = re.compile(r'"referenced_image_ids"\s*:\s*\[([^\]]+)\]')
 # 检测模型返回的部分工具调用 JSON（如 {"size":"1920x1088","n":1}）
 # 这些 JSON 包含图片生成工具的参数，但没有实际生成图片
@@ -803,6 +825,7 @@ def stream_image_outputs(
     file_ids = [str(item) for item in last.get("file_ids") or []]
     sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
     message = str(last.get("text") or "").strip()
+    is_text_reply = bool(message and is_model_text_reply_instead_of_image(message))
     logger.info({
         "event": "image_stream_resolve_start",
         "conversation_id": conversation_id,
@@ -820,14 +843,13 @@ def stream_image_outputs(
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=error_text, conversation_id=conversation_id)
         return
     should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
-    if message and not file_ids and not sediment_ids and not should_poll_for_image:
+    if message and not file_ids and not sediment_ids and not should_poll_for_image and not is_text_reply:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
 
     # 检测模型是否返回了文本描述（含 referenced_image_ids）而非实际生成图片
     # 这说明模型已发起图片生成工具调用，但 SSE 在工具完成前断开，
     # 图片可能正在异步生成中。需要使用更积极的轮询策略来获取结果。
-    is_text_reply = bool(message and is_model_text_reply_instead_of_image(message))
     if is_text_reply:
         logger.info({
             "event": "image_detected_text_reply_with_ids",
@@ -884,10 +906,8 @@ def stream_image_outputs(
     # 当检测到文本回复（含 referenced_image_ids）时，使用更长的超时来轮询图片结果。
     # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
     # 导致对话文档中尚未写入图片工具的响应记录。
-    poll_timeout = config.image_poll_timeout_secs
+    poll_timeout = _image_remaining_timeout_secs(backend)
     if is_text_reply and conversation_id:
-        # 文本回复场景下图片可能仍在异步生成，使用更长超时（默认 120s → 额外 180s = 300s）
-        poll_timeout = max(poll_timeout, 300)
         logger.info({
             "event": "image_text_reply_extended_poll",
             "conversation_id": conversation_id,
@@ -971,10 +991,12 @@ def stream_image_outputs(
                 "message_preview": message[:200],
             })
             # 文本回复场景下，图片可能需要 4-5 分钟才能异步生成完成。
-            # 使用 300s 超时并允许多次重试，避免因临时网络问题提前退出。
-            retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
+            # 使用配置的剩余总预算并允许短重试，避免因临时网络问题提前退出。
             MAX_POLL_RETRIES = 3
             for poll_attempt in range(1, MAX_POLL_RETRIES + 1):
+                retry_poll_timeout = _image_remaining_timeout_secs(backend)
+                if retry_poll_timeout <= 0:
+                    break
                 try:
                     polled_file_ids, polled_sediment_ids = backend._poll_image_results(
                         conversation_id,
@@ -1011,7 +1033,7 @@ def stream_image_outputs(
                             "poll_attempt": poll_attempt,
                             "backoff_secs": backoff,
                         })
-                        time.sleep(backoff)
+                        _sleep_image_retry(backend, backoff)
                         continue
                     # 超时错误或重试次数用尽，停止重试
                     break
@@ -1075,8 +1097,7 @@ def stream_image_outputs(
             })
     if should_poll_for_image and conversation_id:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
-        # 使用 300s 超时并允许多次重试，避免因临时网络问题或图片尚未提交而提前退出。
-        retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
+        # 使用配置的剩余总预算并允许短重试，避免因临时网络问题或图片尚未提交而提前退出。
         MAX_FALLBACK_POLL_RETRIES = 3
         for poll_attempt in range(1, MAX_FALLBACK_POLL_RETRIES + 1):
             retry_wait_secs = min(30.0 * poll_attempt, config.image_poll_initial_wait_secs * poll_attempt)
@@ -1086,7 +1107,10 @@ def stream_image_outputs(
                 "retry_wait_secs": retry_wait_secs,
                 "poll_attempt": poll_attempt,
             })
-            time.sleep(retry_wait_secs)
+            _sleep_image_retry(backend, retry_wait_secs)
+            retry_poll_timeout = _image_remaining_timeout_secs(backend)
+            if retry_poll_timeout <= 0:
+                break
             try:
                 polled_file_ids, polled_sediment_ids = backend._poll_image_results(
                     conversation_id,
@@ -1123,7 +1147,7 @@ def stream_image_outputs(
                         "poll_attempt": poll_attempt,
                         "backoff_secs": backoff,
                     })
-                    time.sleep(backoff)
+                    _sleep_image_retry(backend, backoff)
                     continue
                 # 超时错误或重试次数用尽，停止重试
                 break
@@ -1236,8 +1260,16 @@ def _generate_single_image(
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     account_email = ""
+    request_deadline = time.monotonic() + float(config.image_poll_timeout_secs)
 
     while True:
+        remaining_before_attempt = request_deadline - time.monotonic()
+        if remaining_before_attempt <= 0:
+            raise ImagePollTimeoutError(
+                f"ChatGPT 生图超时（已等待 {config.image_poll_timeout_secs} 秒）。"
+                f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
+                f"也可能是账号被限流或生图队列拥堵导致。"
+            )
         try:
             if request.progress_callback:
                 request.progress_callback("getting_account")
@@ -1265,6 +1297,7 @@ def _generate_single_image(
         })
         try:
             backend = OpenAIBackendAPI(access_token=token)
+            backend.image_request_deadline = request_deadline
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1310,7 +1343,7 @@ def _generate_single_image(
             # 轮询超时：换账号重试
             if not emitted_for_token:
                 poll_timeout_retry_count += 1
-                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
+                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES and request_deadline > time.monotonic():
                     logger.warning({
                         "event": "image_poll_timeout_retry",
                         "request_token": token,
@@ -1408,21 +1441,23 @@ def _generate_single_image(
             # TLS/SSL 连接错误：自动重试
             if not emitted_for_token and is_tls_connection_error(last_error):
                 tls_retry_count += 1
-                if tls_retry_count <= MAX_TLS_RETRIES:
+                if tls_retry_count <= MAX_TLS_RETRIES and request_deadline > time.monotonic():
+                    wait_secs = min(2.0 * tls_retry_count, 10.0)
                     logger.warning({
                         "event": "image_stream_tls_retry",
                         "request_token": token,
                         "account_email": account_email,
                         "retry_count": tls_retry_count,
                         "index": index,
+                        "wait_secs": wait_secs,
                         "error": last_error[:200],
                     })
-                    time.sleep(min(2.0 * tls_retry_count, 10.0))
+                    _sleep_until_deadline(request_deadline, wait_secs)
                     continue
             # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
             if not emitted_for_token and is_connection_timeout_error(last_error):
                 conn_timeout_retry_count += 1
-                if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
+                if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES and request_deadline > time.monotonic():
                     wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
                     logger.warning({
                         "event": "image_stream_conn_timeout_retry",
@@ -1433,7 +1468,7 @@ def _generate_single_image(
                         "wait_secs": wait_secs,
                         "error": last_error[:200],
                     })
-                    time.sleep(wait_secs)
+                    _sleep_until_deadline(request_deadline, wait_secs)
                     continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
 

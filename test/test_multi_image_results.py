@@ -5,8 +5,14 @@ import unittest
 from unittest import mock
 
 from services.config import config
-from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import ImageOutput, extract_conversation_ids
+from services.openai_backend_api import ImagePollTimeoutError, OpenAIBackendAPI
+from services.protocol.conversation import (
+    ConversationRequest,
+    ImageOutput,
+    _generate_single_image,
+    extract_conversation_ids,
+    stream_image_outputs,
+)
 from services.protocol.openai_v1_response import stream_image_response
 
 
@@ -119,7 +125,12 @@ class MultiImageResultTests(unittest.TestCase):
         ])
 
         with (
-            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0, "image_poll_interval_secs": 0.5}),
+            mock.patch.dict(config.data, {
+                "image_poll_initial_wait_secs": 0,
+                "image_poll_interval_secs": 0.5,
+                "image_check_before_hit_enabled": True,
+                "image_settle_enabled": True,
+            }),
             mock.patch("services.openai_backend_api.time.sleep", lambda _seconds: None),
         ):
             file_ids, sediment_ids = backend._poll_image_results("conv-1", timeout_secs=10)
@@ -174,6 +185,64 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual([event["output_index"] for event in done_events], [0, 1])
         self.assertEqual([item["result"] for item in completed["output"]], [first, second])
+
+    def test_text_reply_retry_poll_uses_configured_timeout_without_300_second_floor(self) -> None:
+        backend = mock.Mock()
+        backend.stream_conversation.return_value = iter([
+            '{"conversation_id":"conv-1","message":{"author":{"role":"assistant"},'
+            '"content":{"parts":["{\\"referenced_image_ids\\":[\\"file-input\\"]}"]}}}',
+            "[DONE]",
+        ])
+        backend.resolve_conversation_image_urls.return_value = []
+        backend._poll_image_results.side_effect = RuntimeError("temporary upstream failure")
+
+        with (
+            mock.patch.dict(config.data, {"image_poll_timeout_secs": 7, "image_poll_initial_wait_secs": 0}),
+            mock.patch("services.protocol.conversation.time.sleep", lambda _seconds: None),
+        ):
+            outputs = list(stream_image_outputs(
+                backend,
+                ConversationRequest(prompt="draw", model="gpt-image-2"),
+            ))
+
+        self.assertEqual(outputs[-1].kind, "message")
+        self.assertEqual([call.args[1] for call in backend._poll_image_results.call_args_list], [7, 7, 7])
+
+    def test_image_generation_sse_request_uses_configured_image_timeout(self) -> None:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.test"
+        backend.session = mock.Mock()
+        backend.session.post.return_value.status_code = 200
+        backend._image_headers = mock.Mock(return_value={"Accept": "text/event-stream"})
+        requirements = mock.Mock(token="token", proof_token="", turnstile_token="", so_token="")
+
+        with mock.patch.dict(config.data, {"image_poll_timeout_secs": 11}):
+            backend._start_image_generation("draw", requirements, "conduit", "gpt-image-2")
+
+        self.assertEqual(backend.session.post.call_args.kwargs["timeout"], 11)
+
+    def test_image_poll_timeout_retry_stops_when_configured_budget_is_exhausted(self) -> None:
+        backend = mock.Mock()
+        backend.image_request_deadline = None
+        token = "token-1"
+
+        def fail_poll(*_args, **_kwargs):
+            raise ImagePollTimeoutError("timed out")
+
+        with (
+            mock.patch.dict(config.data, {"image_poll_timeout_secs": 1}),
+            mock.patch("services.protocol.conversation.time.monotonic", side_effect=[100.0, 100.1, 101.2]),
+            mock.patch("services.protocol.conversation.account_service.get_available_access_token", return_value=token) as get_token,
+            mock.patch("services.protocol.conversation.account_service.get_account", return_value={"email": "a@example.test"}),
+            mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=fail_poll),
+        ):
+            with self.assertRaises(ImagePollTimeoutError):
+                _generate_single_image(ConversationRequest(prompt="draw", model="gpt-image-2"), 1, 1)
+
+        self.assertEqual(get_token.call_count, 1)
+        self.assertEqual(backend.image_request_deadline, 101.0)
 
 
 if __name__ == "__main__":

@@ -201,6 +201,16 @@ class OpenAIBackendAPI:
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
+    def _image_request_timeout_secs(self) -> float:
+        deadline = getattr(self, "image_request_deadline", None)
+        if deadline is not None:
+            try:
+                remaining = float(deadline) - time.monotonic()
+                return max(1.0, remaining)
+            except (TypeError, ValueError):
+                pass
+        return float(config.image_poll_timeout_secs)
+
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
         raw_fp = account.get("fp")
@@ -755,7 +765,7 @@ class OpenAIBackendAPI:
             "event": "codex_responses_request_debug",
             "url": self.base_url + path,
             "transport": "urllib.request",
-            "timeout_secs": 1200,
+            "timeout_secs": self._image_request_timeout_secs(),
             "account_email": str(account.get("email") or "").strip(),
             "source_type": str(account.get("source_type") or "").strip(),
             "account_type": str(account.get("type") or "").strip(),
@@ -788,7 +798,7 @@ class OpenAIBackendAPI:
             },
         })
         try:
-            with urllib.request.urlopen(request, timeout=1200) as raw:
+            with urllib.request.urlopen(request, timeout=self._image_request_timeout_secs()) as raw:
                 yield from self._iter_codex_response_events(raw)
         except urllib.error.HTTPError as error:
             body_text = error.read().decode("utf-8", "replace")
@@ -974,7 +984,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
             json=payload,
-            timeout=300,
+            timeout=self._image_request_timeout_secs(),
             stream=True,
         )
         ensure_ok(response, path)

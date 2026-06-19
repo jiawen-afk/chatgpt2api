@@ -58,6 +58,19 @@ class ConfigLoadingTests(unittest.TestCase):
                 else:
                     module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
 
+    def test_image_timeout_retry_secs_is_normalized_in_public_config(self) -> None:
+        module = self.config_module
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_file = Path(tmp_dir) / "config.json"
+            config_file.write_text(
+                json.dumps({"auth-key": "test-auth", "image_timeout_retry_secs": "0"}),
+                encoding="utf-8",
+            )
+            store = module.ConfigStore(config_file)
+
+            self.assertEqual(store.image_timeout_retry_secs, 1)
+            self.assertEqual(store.get()["image_timeout_retry_secs"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
