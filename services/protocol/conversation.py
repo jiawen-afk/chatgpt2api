@@ -13,7 +13,7 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
-from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI, TEXT_STREAM_TIMEOUT_SECS
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
@@ -703,34 +703,48 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
-    while True:
-        if token and token in attempted_tokens:
-            raise RuntimeError("no available text account")
-        if token:
-            attempted_tokens.add(token)
-        try:
-            active_backend = OpenAIBackendAPI(access_token=token)
-            for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
-                if event.get("type") != "conversation.delta":
-                    continue
-                delta = str(event.get("delta") or "")
-                if delta:
-                    emitted = True
-                    yield delta
-            account_service.mark_text_used(token)
-            return
-        except Exception as exc:
-            error_message = str(exc)
-            if token and not emitted and is_token_invalid_error(error_message):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
-                if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
-                    token = refreshed_token
-                else:
-                    account_service.remove_invalid_token(token, "text_stream")
-                    token = account_service.get_text_access_token(attempted_tokens)
-                if token:
-                    continue
-            raise
+    had_deadline = hasattr(backend, "request_deadline")
+    previous_deadline = getattr(backend, "request_deadline", None)
+    try:
+        request_deadline = float(previous_deadline) if previous_deadline is not None else time.monotonic() + TEXT_STREAM_TIMEOUT_SECS
+    except (TypeError, ValueError):
+        request_deadline = time.monotonic() + TEXT_STREAM_TIMEOUT_SECS
+    backend.request_deadline = request_deadline
+    try:
+        while True:
+            if token and token in attempted_tokens:
+                raise RuntimeError("no available text account")
+            if token:
+                attempted_tokens.add(token)
+            try:
+                active_backend = OpenAIBackendAPI(access_token=token)
+                active_backend.request_deadline = request_deadline
+                for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
+                    if event.get("type") != "conversation.delta":
+                        continue
+                    delta = str(event.get("delta") or "")
+                    if delta:
+                        emitted = True
+                        yield delta
+                account_service.mark_text_used(token)
+                return
+            except Exception as exc:
+                error_message = str(exc)
+                if token and not emitted and is_token_invalid_error(error_message):
+                    refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
+                    if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
+                        token = refreshed_token
+                    else:
+                        account_service.remove_invalid_token(token, "text_stream")
+                        token = account_service.get_text_access_token(attempted_tokens)
+                    if token:
+                        continue
+                raise
+    finally:
+        if had_deadline:
+            backend.request_deadline = previous_deadline
+        elif hasattr(backend, "request_deadline"):
+            delattr(backend, "request_deadline")
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
