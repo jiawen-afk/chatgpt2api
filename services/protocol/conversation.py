@@ -321,6 +321,7 @@ class ConversationRequest:
     model: str = "auto"
     prompt: str = ""
     messages: list[dict[str, Any]] | None = None
+    thinking_effort: str = ""
     images: list[str] | None = None
     n: int = 1
     size: str | None = None
@@ -679,6 +680,7 @@ def conversation_events(
     images: list[str] | None = None,
     size: str | None = None,
     quality: str = "auto",
+    thinking_effort: str = "",
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
@@ -691,6 +693,7 @@ def conversation_events(
         prompt=final_prompt,
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
+        thinking_effort=thinking_effort if not image_model else "",
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 

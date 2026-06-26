@@ -553,9 +553,26 @@ class OpenAIBackendAPI:
             })
         return conversation_messages
 
-    def _conversation_payload(self, messages: list[Dict[str, Any]], model: str, timezone: str) -> Dict[str, Any]:
+    @staticmethod
+    def _normalize_thinking_effort(value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"", "none"}:
+            return ""
+        if normalized in {"low", "medium", "high"}:
+            return normalized
+        if normalized in {"xhigh", "extended"}:
+            return "extended"
+        return ""
+
+    def _conversation_payload(
+            self,
+            messages: list[Dict[str, Any]],
+            model: str,
+            timezone: str,
+            thinking_effort: str = "",
+    ) -> Dict[str, Any]:
         """把标准 messages 构造成 web 对话请求体。"""
-        return {
+        payload = {
             "action": "next",
             "messages": self._api_messages_to_conversation_messages(messages),
             "model": model,
@@ -585,6 +602,10 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
             },
         }
+        normalized_effort = self._normalize_thinking_effort(thinking_effort)
+        if normalized_effort:
+            payload["thinking_effort"] = normalized_effort
+        return payload
 
     def _image_model_slug(self, model: str) -> str:
         """把标准图片模型名映射到底层 model slug。"""
@@ -2601,6 +2622,7 @@ class OpenAIBackendAPI:
             prompt: str = "",
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
+            thinking_effort: str = "",
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
