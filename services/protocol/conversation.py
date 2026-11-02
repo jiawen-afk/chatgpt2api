@@ -31,6 +31,7 @@ from utils.helper import (
 )
 from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
+from utils.ui_markup import strip_ui_markup
 
 
 class ImageGenerationError(Exception):
@@ -210,39 +211,52 @@ def message_text(content: Any) -> str:
     return ""
 
 
+def needs_global_system(messages: list[dict[str, Any]]) -> bool:
+    """normalize_messages also runs inside conversation_events, on messages the protocol
+    layer already normalized. Adding the global system prompt a second time sends the same
+    system turn twice, which models tend to mirror back as duplicated instructions."""
+    prompt = str(config.global_system_prompt or "")
+    if not prompt:
+        return False
+    if not messages:
+        return True
+    first = messages[0]
+    if str(first.get("role") or "") != "system":
+        return True
+    return message_text(first.get("content")) != prompt
+
+
 def normalize_messages(messages: object, system: Any = None) -> list[dict[str, Any]]:
+    source = [message for message in messages if isinstance(message, dict)] if isinstance(messages, list) else []
     normalized = []
-    if config.global_system_prompt:
+    if needs_global_system(source):
         normalized.append({"role": "system", "content": config.global_system_prompt})
     system_text = message_text(system)
     if system_text:
         normalized.append({"role": "system", "content": system_text})
-    if isinstance(messages, list):
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            role = message.get("role", "user")
-            content = message.get("content", "")
-            text = message_text(content)
-            images: list[tuple[bytes, str]] = []
-            if role == "user":
-                images.extend(extract_image_from_message_content(content))
-                if isinstance(content, list):
-                    for part in content:
-                        if not isinstance(part, dict) or part.get("type") != "image":
-                            continue
-                        data = part.get("data")
-                        if isinstance(data, (bytes, bytearray)) and all(existing[0] != bytes(data) for existing in images):
-                            images.append((bytes(data), str(part.get("mime") or "image/png")))
-            if images:
-                parts: list[Any] = []
-                if text:
-                    parts.append({"type": "text", "text": text})
-                for data, mime in images:
-                    parts.append({"type": "image", "data": data, "mime": mime})
-                normalized.append({"role": role, "content": parts})
-            else:
-                normalized.append({"role": role, "content": text})
+    for message in source:
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        text = message_text(content)
+        images: list[tuple[bytes, str]] = []
+        if role == "user":
+            images.extend(extract_image_from_message_content(content))
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict) or part.get("type") != "image":
+                        continue
+                    data = part.get("data")
+                    if isinstance(data, (bytes, bytearray)) and all(existing[0] != bytes(data) for existing in images):
+                        images.append((bytes(data), str(part.get("mime") or "image/png")))
+        if images:
+            parts: list[Any] = []
+            if text:
+                parts.append({"type": "text", "text": text})
+            for data, mime in images:
+                parts.append({"type": "image", "data": data, "mime": mime})
+            normalized.append({"role": role, "content": parts})
+        else:
+            normalized.append({"role": role, "content": text})
     return normalized
 
 
@@ -355,14 +369,35 @@ class ConversationRequest:
 
 @dataclass
 class ConversationState:
+    # `text` follows what the client has actually received: deltas are append-only, so it
+    # only ever grows, even when upstream rewrites what it is generating.
     text: str = ""
-    raw_text: str = ""
     conversation_id: str = ""
     file_ids: list[str] = field(default_factory=list)
     sediment_ids: list[str] = field(default_factory=list)
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
+
+
+@dataclass
+class MessageStream:
+    """上游单条 assistant 消息的快照状态。
+
+    同一条消息的后续事件只会把文本变长，所以「新增部分 = 新快照减去旧快照」是精确的；
+    只有消息被改写、或者换了另一条消息时，才需要和已发文本做对齐。
+
+    `shadow` 用于并行变体：上游可能为同一轮同时生成两条内容几乎相同的消息（见
+    `variant_purpose`）。本轮一旦锁定主消息，其余 id 整条忽略，否则两份答案会交替追加
+    进同一个输出里。
+    """
+
+    message_id: str = ""
+    raw: str = ""
+    text: str = ""
+    tail_confirmed: bool = False
+    shadow: bool = False
+    finished: bool = False
 
 
 @dataclass
@@ -432,6 +467,136 @@ def strip_history(text: str, history_text: str = "") -> str:
     return text
 
 
+def common_prefix_length(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
+MIN_CONTAINED_LENGTH = 4
+ANCHOR_PROBE_SIZES = (64, 32, 16, 8)
+VARIANT_SWITCH_MARGIN = 32
+
+
+def locate_snapshot_anchor(emitted: str, snapshot: str) -> int | None:
+    """在已发文本里找快照开头的位置，用于对齐上游「重来」的那一段。"""
+    for size in ANCHOR_PROBE_SIZES:
+        if len(snapshot) < size:
+            continue
+        position = emitted.rfind(snapshot[:size])
+        if position >= 0:
+            return position
+    return None
+
+
+def emitted_prefix_length(emitted: str, snapshot: str) -> int:
+    """How much of `snapshot`'s head the client has already received.
+
+    Deltas are append-only, so anything the client already has must never be sent again.
+    Upstream repeats text in three shapes, all of which show up as a snapshot that is not a
+    plain extension of what was streamed:
+
+    * the whole answer restarts from the greeting (regeneration / parallel variant),
+    * the answer restarts at a section that was already streamed (`## 二、...`),
+    * the earlier text is rewritten by sanitize_output_text, e.g. a collapsed space.
+
+    The snapshot is compared with its leading whitespace removed: the first snapshot of a
+    retake is often glued to the previous sentence while every later one starts with blank
+    lines, and a byte-exact comparison made all of them look like brand new text. When the
+    snapshot starts earlier than the end of the emitted text, the head is located inside it
+    instead of only at the tail, which is what a section retake looks like.
+    """
+    if not snapshot:
+        return 0
+    stripped = snapshot.lstrip()
+    if not stripped:
+        # Only whitespace: let it through as the separator it is.
+        return 0
+    lead = len(snapshot) - len(stripped)
+    body = stripped.rstrip()
+
+    if len(body) >= MIN_CONTAINED_LENGTH and body in emitted:
+        return len(snapshot)
+
+    prefix = common_prefix_length(emitted, stripped)
+    if prefix >= len(emitted) or prefix >= len(stripped):
+        # 正常续写，或者快照本身就是已发文本的前缀。
+        return min(len(snapshot), lead + prefix)
+
+    # 上游从更早的位置重来：先在已发文本里定位快照开头，再按该位置算重叠长度。
+    covered = prefix
+    anchor = locate_snapshot_anchor(emitted, stripped)
+    if anchor is not None:
+        covered = max(covered, common_prefix_length(emitted[anchor:], stripped))
+    if covered <= 0:
+        return 0
+    return lead + covered
+
+
+def log_stream_join(state: ConversationState, stream: MessageStream, snapshot: str,
+                    emitted: str, covered: int) -> None:
+    """记录一次「新快照需要对已发文本做对齐」的拼接。
+
+    单条消息从头流到尾只会在这里记一条（新消息的第一份快照）；如果同一条消息反复出现，
+    说明上游在改写已经生成过的内容，日志里的 covered 就是两边的实际重合长度。
+    """
+    payload = {
+        "event": "stream_text_join",
+        "diverged": bool(stream.text),
+        "message_id": stream.message_id,
+        "conversation_id": state.conversation_id,
+        "snapshot_length": len(snapshot),
+        "emitted_length": len(emitted),
+        "covered_length": covered,
+        "appended_length": max(0, len(snapshot) - covered),
+    }
+    try:
+        if stream.text:
+            logger.info(payload)
+        else:
+            logger.debug(payload)
+    except Exception:
+        pass
+
+
+def log_stream_switch(state: ConversationState, previous: MessageStream,
+                      current: MessageStream, emitted_length: int) -> None:
+    """记录一次「换一条消息继续输出」。
+
+    `extend` 策略下，当前跟的那条停滞、另一条明显更长时切换过去；只补长度差额，
+    所以既不会重复发送，也不会把后到的那份内容丢掉。
+    """
+    try:
+        logger.info({
+            "event": "stream_text_variant_switch",
+            "conversation_id": state.conversation_id,
+            "from_message_id": previous.message_id,
+            "to_message_id": current.message_id,
+            "from_length": len(previous.text),
+            "to_length": len(current.text),
+            "emitted_length": emitted_length,
+        })
+    except Exception:
+        pass
+
+
+def log_stream_variant(state: ConversationState, stream: MessageStream,
+                       snapshot: str, emitted: str) -> None:
+    """记录一条被忽略的并行变体。上游 `variant_purpose=comparison_implicit` 会同时生成两条。"""
+    try:
+        logger.info({
+            "event": "stream_text_variant_shadowed",
+            "message_id": stream.message_id,
+            "conversation_id": state.conversation_id,
+            "snapshot_length": len(snapshot),
+            "emitted_length": len(emitted),
+        })
+    except Exception:
+        pass
+
+
 def sanitize_output_text(text: str) -> str:
     text = str(text or "")
 
@@ -474,6 +639,8 @@ def sanitize_output_text(text: str) -> str:
     text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
     text = re.sub(r"\ue200[^\ue201]*$", "", text)
     text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+    if config.strip_ui_markup:
+        text = strip_ui_markup(text)
     return text
 
 
@@ -505,6 +672,40 @@ def event_assistant_text(event: dict[str, Any], history_text: str = "") -> str:
         if isinstance(message, dict) and (message.get("author") or {}).get("role") == "assistant":
             return strip_history(assistant_message_text(message), history_text)
     return ""
+
+
+def event_assistant_message_id(event: dict[str, Any]) -> str:
+    for candidate in (event, event.get("v")):
+        if not isinstance(candidate, dict):
+            continue
+        message = candidate.get("message")
+        if not isinstance(message, dict):
+            continue
+        if str((message.get("author") or {}).get("role") or "").strip().lower() != "assistant":
+            continue
+        return str(message.get("id") or message.get("message_id") or "")
+    return ""
+
+
+def finished_message_id(event: dict[str, Any]) -> str | None:
+    """上游标记「这条消息写完了」时返回它的 id（空串表示归属当前消息），否则返回 None。
+
+    上游写完一条消息后会长时间保持连接（并行变体时尤其明显），只等 `[DONE]` 会让客户端
+    在答案已经完整之后还干等，所以这里把完成信号拿出来用于主动收尾。
+    """
+    for candidate in (event, event.get("v")):
+        if not isinstance(candidate, dict):
+            continue
+        message = candidate.get("message")
+        if not isinstance(message, dict):
+            continue
+        if str((message.get("author") or {}).get("role") or "").strip().lower() != "assistant":
+            continue
+        if str(message.get("status") or "") == "finished_successfully" or message.get("end_turn") is True:
+            return str(message.get("id") or message.get("message_id") or "")
+    if event.get("p") == "/message/status" and event.get("v") == "finished_successfully":
+        return ""
+    return None
 
 
 def apply_text_patch(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
@@ -656,10 +857,15 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
 
 
 def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
-                               history_messages: list[str] | None = None) -> Iterator[dict[str, Any]]:
+                               history_messages: list[str] | None = None,
+                               stop_on_finish: bool = False) -> Iterator[dict[str, Any]]:
     state = ConversationState()
     history_messages = history_messages or []
     history_index = 0
+    streams: dict[str, MessageStream] = {}
+    current_message = ""
+    primary_message: str | None = None
+    leader_message: str | None = None
     for payload in payloads:
         # print(f"[upstream_sse] {payload}", flush=True)
         if not payload:
@@ -679,18 +885,85 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         update_conversation_state(state, payload, event)
         if history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
             history_index += 1
-            state.raw_text = ""
+            streams.clear()
+            current_message = ""
+            primary_message = None
+            leader_message = None
             state.text = ""
             continue
-        next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
+        message_id = event_assistant_message_id(event)
+        if message_id:
+            current_message = message_id
+        stream_key = current_message
+        stream = streams.get(stream_key)
+        if stream is None:
+            stream = MessageStream(message_id=stream_key)
+            streams[stream_key] = stream
+        next_raw_text = assistant_raw_text(event, stream.raw, history_text)
         next_text = sanitize_output_text(next_raw_text)
-        state.raw_text = next_raw_text
-        if next_text != state.text:
-            delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
-            state.text = next_text
+        stream.raw = next_raw_text
+        finished_id = finished_message_id(event)
+        if finished_id is not None:
+            finished_stream = streams.get(finished_id or stream_key)
+            if finished_stream is not None:
+                finished_stream.finished = True
+
+        delta = ""
+        if not stream.shadow and next_text != stream.text:
+            previous_text = stream.text
+            stream.text = next_text
+            emitted_text = state.text
+            policy = config.stream_variant_policy
+            skip = False
+            if policy == "follow_first" and primary_message is not None and stream_key != primary_message:
+                # 本轮已锁定一条消息，其他 id 是并行变体：整条忽略。
+                stream.shadow = True
+                log_stream_variant(state, stream, next_text, emitted_text)
+                skip = True
+            elif policy == "extend" and leader_message is not None and stream_key != leader_message:
+                leader = streams.get(leader_message)
+                if leader is None or len(next_text) <= len(leader.text) + VARIANT_SWITCH_MARGIN:
+                    # 明显落后于当前跟的那条，先不发；等它真的更长再切过去。
+                    skip = True
+                else:
+                    log_stream_switch(state, leader, stream, len(emitted_text))
+                    leader_message = stream_key
+
+            if not skip:
+                if policy == "extend":
+                    # 只补「已发长度」之后的差额：并行两条消息时既不会重复，也不会把后到的那份丢掉。
+                    delta = next_text[len(emitted_text):] if len(next_text) > len(emitted_text) else ""
+                elif stream.tail_confirmed and next_text.startswith(previous_text):
+                    # 同一条消息在变长，而且客户端当前的结尾正是这条消息上一次的快照：
+                    # 快照之间的前缀关系是协议保证的，直接取差额即可。
+                    delta = next_text[len(previous_text):]
+                else:
+                    # 换了消息、这条消息被改写、或者上一次的内容并不是由这条消息追加的：
+                    # 只发客户端还没有的部分。
+                    covered = emitted_prefix_length(emitted_text, next_text)
+                    delta = next_text[covered:]
+                    log_stream_join(state, stream, next_text, emitted_text, covered)
+
+                if delta:
+                    if policy == "extend" and leader_message is None:
+                        leader_message = stream_key
+                    if policy == "follow_first" and primary_message is None:
+                        # 第一条真正产出内容的消息就是本轮的主消息。
+                        primary_message = stream_key
+                    state.text = emitted_text + delta
+                stream.tail_confirmed = state.text.endswith(next_text)
+
+        if delta:
             yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
-            continue
-        yield conversation_base_event("conversation.event", state, raw=event)
+        else:
+            yield conversation_base_event("conversation.event", state, raw=event)
+
+        if stop_on_finish and streams and all(
+            item.finished for item in streams.values() if not item.shadow
+        ):
+            # 上游已经把这条（或这些）消息标记为完成，不必再等它关连接。
+            yield conversation_base_event("conversation.done", state, done=True)
+            break
 
 
 def conversation_events(
@@ -716,7 +989,9 @@ def conversation_events(
         system_hints=["picture_v2"] if image_model else None,
         thinking_effort=thinking_effort if not image_model else "",
     )
-    yield from iter_conversation_payloads(payloads, history_text, history_messages)
+    yield from iter_conversation_payloads(
+        payloads, history_text, history_messages, stop_on_finish=not image_model
+    )
 
 
 def text_backend() -> OpenAIBackendAPI:
@@ -727,6 +1002,9 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
+    started_at = time.monotonic()
+    last_delta_at = 0.0
+    delta_count = 0
     had_deadline = hasattr(backend, "request_deadline")
     previous_deadline = getattr(backend, "request_deadline", None)
     try:
@@ -756,6 +1034,8 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                     delta = str(event.get("delta") or "")
                     if delta:
                         emitted = True
+                        delta_count += 1
+                        last_delta_at = time.monotonic()
                         yield delta
                 account_service.mark_text_used(token)
                 return
@@ -775,6 +1055,18 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 if active_backend is not None:
                     active_backend.close()
     finally:
+        if emitted:
+            # `tail_gap_ms` 是「最后一次吐出文本」到「流真正结束」之间的间隔，
+            # 客户端感觉到的"卡着"就是这个值。
+            try:
+                logger.info({
+                    "event": "text_stream_metrics",
+                    "deltas": delta_count,
+                    "total_ms": int((time.monotonic() - started_at) * 1000),
+                    "tail_gap_ms": int((time.monotonic() - last_delta_at) * 1000) if last_delta_at else 0,
+                })
+            except Exception:
+                pass
         if had_deadline:
             backend.request_deadline = previous_deadline
         elif hasattr(backend, "request_deadline"):

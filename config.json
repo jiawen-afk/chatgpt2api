@@ -37,6 +37,9 @@
   "base_url": "",
   "sensitive_words": [],
   "global_system_prompt": "",
+  "strip_ui_markup": true,
+  "stream_variant_policy": "extend",
+  "upstream_variant_purpose": "comparison_implicit",
   "ai_review": {
     "enabled": false,
     "base_url": "",

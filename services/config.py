@@ -543,6 +543,37 @@ class ConfigStore:
         return bool(value)
 
     @property
+    def strip_ui_markup(self) -> bool:
+        """把上游的组件标记（<box>/<row>/<AsyncImage> 等）降级为 Markdown。"""
+        value = self.data.get("strip_ui_markup", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(value)
+
+    @property
+    def stream_variant_policy(self) -> str:
+        """上游并行生成多条消息时的处理策略。
+
+        - `extend`：只补「已发长度」之后的差额，两条消息的内容都不丢（默认）
+        - `follow_first`：本轮只跟第一条消息，其余整条忽略（绝不重复，但可能被截断）
+        - `merge`：和已发文本做内容对齐拼接（可能重复）
+        """
+        value = str(self.data.get("stream_variant_policy") or "").strip().lower()
+        return value if value in {"extend", "follow_first", "merge"} else "extend"
+
+    @property
+    def upstream_variant_purpose(self) -> str:
+        """上游 conversation 请求里的 `variant_purpose`。
+
+        `comparison_implicit` 会让 ChatGPT 为同一轮并行生成两条回答，这也是流式输出里
+        出现两份内容的原因。配成空字符串表示不发送这个字段。
+        """
+        value = self.data.get("upstream_variant_purpose")
+        if value is None:
+            return "comparison_implicit"
+        return str(value).strip()
+
+    @property
     def auto_remove_rate_limited_accounts(self) -> bool:
         value = self.data.get("auto_remove_rate_limited_accounts", False)
         if isinstance(value, str):

@@ -664,7 +664,6 @@ class OpenAIBackendAPI:
             "system_hints": [],
             "timezone": timezone,
             "timezone_offset_min": -480,
-            "variant_purpose": "comparison_implicit",
             "websocket_request_id": new_uuid(),
             "client_contextual_info": {
                 "is_dark_mode": False,
@@ -676,6 +675,9 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
             },
         }
+        variant_purpose = config.upstream_variant_purpose
+        if variant_purpose:
+            payload["variant_purpose"] = variant_purpose
         normalized_effort = self._normalize_thinking_effort(thinking_effort)
         if normalized_effort:
             payload["thinking_effort"] = normalized_effort
