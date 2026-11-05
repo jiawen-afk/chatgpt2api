@@ -18,6 +18,8 @@ from services.proxy_service import proxy_settings
 from utils.log import logger
 
 DEFAULT_WEB_IMAGE_MODELS = {
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare",
     "gpt-image-2",

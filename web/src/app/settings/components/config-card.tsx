@@ -20,7 +20,13 @@ export function ConfigCard() {
   const [proxyTestResult, setProxyTestResult] = useState<ProxyTestResult | null>(null);
   const [isRefreshingImageModels, setIsRefreshingImageModels] = useState(false);
   const logLevelOptions = ["debug", "info", "warning", "error"];
-  const fallbackImageModels = ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "gpt-image-2"];
+  const fallbackImageModels = [
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
+    "gpt-image-2",
+  ];
   const config = useSettingsStore((state) => state.config);
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);

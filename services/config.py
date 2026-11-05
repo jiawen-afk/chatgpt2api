@@ -83,6 +83,8 @@ DEFAULT_THIRD_PARTY_APPS = {
 }
 
 DEFAULT_IMAGE_MODELS = [
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare",
     "gpt-image-2",
@@ -139,7 +141,7 @@ def _normalize_custom_image_models(value: object) -> list[str]:
 def _image_models_with_cache(cache: object, legacy_custom_models: object = None) -> list[str]:
     cached = _normalize_image_model_list(cache)
     if cached:
-        return cached
+        return _normalize_image_model_list([*DEFAULT_IMAGE_MODELS, *cached])
     legacy = _normalize_custom_image_models(legacy_custom_models)
     return list(DEFAULT_IMAGE_MODELS) + legacy
 

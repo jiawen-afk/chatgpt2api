@@ -267,6 +267,32 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual(backend.session.post.call_args.kwargs["timeout"], 11)
 
+    def test_image_26_requests_preserve_model_with_legacy_cache(self) -> None:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.test"
+        backend.session = mock.Mock()
+        backend.session.post.return_value.status_code = 200
+        backend.session.post.return_value.json.return_value = {"conduit_token": "conduit"}
+        backend._image_headers = mock.Mock(return_value={})
+        requirements = mock.Mock(token="token", proof_token="", turnstile_token="", so_token="")
+        reference = {
+            "file_id": "file-1", "file_name": "image.png", "file_size": 100,
+            "mime_type": "image/png", "width": 64, "height": 64,
+        }
+
+        with mock.patch.dict(config.data, {"image_models_cache": ["gpt-image-2"]}):
+            for model in ("gpt-image-2.6-flare", "gpt-image-2.6-sunburst"):
+                with self.subTest(model=model):
+                    backend._prepare_image_conversation("draw", requirements, model)
+                    self.assertEqual(backend.session.post.call_args.kwargs["json"]["model"], model)
+
+                    for references in ([], [reference]):
+                        backend._start_image_generation("draw", requirements, "conduit", model, references)
+                        payload = backend.session.post.call_args.kwargs["json"]
+                        self.assertEqual(payload["model"], model)
+                        content = payload["messages"][0]["content"]
+                        self.assertEqual(content["content_type"], "multimodal_text" if references else "text")
+
     def test_image_prepare_request_uses_remaining_deadline(self) -> None:
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
         backend.base_url = "https://chatgpt.test"

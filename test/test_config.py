@@ -94,6 +94,8 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(
                 store.image_models,
                 [
+                    "gpt-image-2.6-sunburst",
+                    "gpt-image-2.6-flare",
                     "gpt-image-2.5-sunburst",
                     "gpt-image-2.5-flare",
                     "gpt-image-2",
@@ -108,6 +110,8 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(
                 store.get()["image_models"],
                 [
+                    "gpt-image-2.6-sunburst",
+                    "gpt-image-2.6-flare",
                     "gpt-image-2.5-sunburst",
                     "gpt-image-2.5-flare",
                     "gpt-image-2",
@@ -132,9 +136,33 @@ class ConfigLoadingTests(unittest.TestCase):
                 "image_models_updated_at": "2026-09-20T12:00:00+00:00",
             })
 
-            self.assertEqual(saved["image_models"], ["gpt-image-2.5-sunburst", "gpt-image-2", "gpt-5-7"])
+            self.assertEqual(saved["image_models"], [*module.DEFAULT_IMAGE_MODELS, "gpt-5-7"])
             self.assertEqual(saved["image_models_source"], "upstream")
             self.assertEqual(saved["image_models_updated_at"], "2026-09-20T12:00:00+00:00")
+
+    def test_new_builtin_models_can_be_selected_with_legacy_cache(self) -> None:
+        module = self.config_module
+        for model in ("gpt-image-2.6-flare", "gpt-image-2.6-sunburst"):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as tmp_dir:
+                config_file = Path(tmp_dir) / "config.json"
+                config_file.write_text(json.dumps({
+                    "auth-key": "test-auth",
+                    "image_models_cache": ["gpt-image-2.5-sunburst", "gpt-image-2", "gpt-5-7"],
+                    "default_image_model": "gpt-image-2.5-sunburst",
+                }), encoding="utf-8")
+                store = module.ConfigStore(config_file)
+
+                self.assertIn(model, store.image_models)
+                self.assertIn("gpt-5-7", store.image_models)
+                self.assertEqual(store.default_image_model, "gpt-image-2.5-sunburst")
+                self.assertEqual(len(store.image_models), len(set(store.image_models)))
+
+                saved = store.update({"default_image_model": model})
+                reloaded = module.ConfigStore(config_file)
+
+                self.assertEqual(saved["default_image_model"], model)
+                self.assertEqual(reloaded.default_image_model, model)
+                self.assertIn(model, reloaded.get()["image_models"])
 
     def test_default_image_model_is_saved_and_reloaded(self) -> None:
         module = self.config_module
