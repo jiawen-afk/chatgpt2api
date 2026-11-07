@@ -18,7 +18,7 @@ from services.config import DATA_DIR, config
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 
 class ImageStorageError(RuntimeError):
@@ -49,6 +49,25 @@ def _safe_relative_path(path: str) -> str:
     if any(part in {"", ".", ".."} for part in parts):
         raise HTTPException(status_code=404, detail="image not found")
     return Path(*parts).as_posix()
+
+
+def _image_mime_type(payload: bytes) -> str:
+    """按真实字节判断图片 MIME，用于落盘后缀和 WebDAV 的 Content-Type。
+
+    上游除了 PNG，还可能在要求 GIF 时直接回一段动图字节，不能一律当成 image/png。
+    """
+    try:
+        with Image.open(io.BytesIO(payload)) as image:
+            return Image.MIME.get(image.format or "", "image/png")
+    except Exception:
+        return "image/png"
+
+
+def _image_extension(payload: bytes) -> str:
+    extension = _image_mime_type(payload).split("/", 1)[-1] or "png"
+    if extension == "jpeg":
+        return "jpg"
+    return extension if extension in {"png", "jpg", "jpeg", "webp", "gif"} else "png"
 
 
 def _image_dimensions(payload: bytes) -> tuple[int, int] | None:
@@ -198,7 +217,7 @@ class ImageStorageService:
 
     def make_relative_path(self, image_data: bytes) -> str:
         file_hash = hashlib.md5(image_data).hexdigest()
-        filename = f"{int(time.time())}_{file_hash}.png"
+        filename = f"{int(time.time())}_{file_hash}.{_image_extension(image_data)}"
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
@@ -219,7 +238,9 @@ class ImageStorageService:
             stored_local = True
 
         if mode in {"webdav", "both"}:
-            remote_url = WebDAVClient(self.settings()).put(rel, image_data)
+            remote_url = WebDAVClient(self.settings()).put(
+                rel, image_data, content_type=_image_mime_type(image_data)
+            )
             stored_webdav = True
 
         dimensions = _image_dimensions(image_data)

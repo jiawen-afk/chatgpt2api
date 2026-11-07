@@ -28,6 +28,9 @@ class ImageGenerationRequest(BaseModel):
     n: int = Field(default=1, ge=1, le=4)
     size: str | None = None
     quality: str = "auto"
+    output_format: str = "png"
+    frame_count: int | None = None
+    frame_duration_ms: int | None = None
     response_format: str = "b64_json"
     history_disabled: bool = True
     stream: bool | None = None

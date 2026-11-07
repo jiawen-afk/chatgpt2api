@@ -24,7 +24,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, normalize_image_output, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -322,9 +322,16 @@ class OpenAIBackendAPI:
         except (TypeError, ValueError):
             return float(config.image_poll_timeout_secs)
 
+    def _image_timeout_budget_secs(self) -> float:
+        budget = getattr(self, "image_timeout_secs", None)
+        try:
+            return float(budget) if budget is not None else float(config.image_poll_timeout_secs)
+        except (TypeError, ValueError):
+            return float(config.image_poll_timeout_secs)
+
     def _image_timeout_message(self) -> str:
         return (
-            f"ChatGPT 生图超时（已等待 {config.image_poll_timeout_secs} 秒）。"
+            f"ChatGPT 生图超时（已等待 {self._image_timeout_budget_secs():g} 秒）。"
             f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
             f"也可能是账号被限流或生图队列拥堵导致。"
         )
@@ -909,10 +916,18 @@ class OpenAIBackendAPI:
             images: list[str] | None = None,
             size: str | None = None,
             quality: str = "auto",
+            output_format: str = "png",
+            frame_count: int | None = None,
+            frame_duration_ms: int | None = None,
     ) -> Iterator[Dict[str, Any]]:
         if not self.access_token:
             raise RuntimeError("access_token is required for codex image endpoints")
         self._ensure_codex_source_account()
+        output_format, frame_count, frame_duration_ms = normalize_image_output(
+            output_format, frame_count, frame_duration_ms
+        )
+        if images and output_format == "gif":
+            raise ValueError("GIF output is not supported for image edits")
         path = "/backend-api/codex/responses"
         payload = {
             "model": CODEX_RESPONSES_MODEL,
@@ -925,7 +940,12 @@ class OpenAIBackendAPI:
                 "action": "edit" if images else "generate",
                 "size": str(size or "1024x1024"),
                 "quality": str(quality or "auto"),
-                "output_format": "png",
+                "output_format": output_format,
+                **(
+                    {"frame_count": frame_count, "frame_duration_ms": frame_duration_ms}
+                    if output_format == "gif"
+                    else {}
+                ),
             }],
             "tool_choice": {"type": "image_generation"},
             "stream": True,
