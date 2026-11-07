@@ -38,6 +38,11 @@ IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
+GIF_DEFAULT_FRAME_COUNT = 9
+GIF_DEFAULT_FRAME_DURATION_MS = 200
+# 动图上游要逐帧生成，实测近 3 分钟，沿用静态图的 120 秒会被截断。
+GIF_IMAGE_TIMEOUT_SECS = 300.0
+
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
@@ -155,6 +160,42 @@ def is_supported_image_model(model: object) -> bool:
 def is_codex_image_model(model: object) -> bool:
     _, base_model = split_image_model(model)
     return base_model == CODEX_IMAGE_MODEL
+
+
+def is_gif_bytes(data: bytes) -> bool:
+    """按 GIF 文件头判断，避免把动图当成 PNG 处理（转码、超分、Content-Type）。"""
+    return bool(data) and data.startswith((b"GIF87a", b"GIF89a"))
+
+
+def normalize_image_output(
+    output_format: object = "png",
+    frame_count: object = None,
+    frame_duration_ms: object = None,
+) -> tuple[str, int | None, int | None]:
+    """归一化生图输出格式与 GIF 帧参数，非法组合直接报错而不是静默降级。"""
+    fmt = str(output_format or "png").strip().lower()
+    if fmt not in {"png", "gif"}:
+        raise ValueError("output_format must be png or gif")
+    if fmt != "gif":
+        if frame_count is not None or frame_duration_ms is not None:
+            raise ValueError("frame_count and frame_duration_ms require GIF output")
+        return fmt, None, None
+
+    def integer(value: object, default: int, low: int, high: int, name: str) -> int:
+        if value is None or value == "":
+            return default
+        if isinstance(value, bool) or not str(value).strip().isdigit():
+            raise ValueError(f"{name} must be an integer")
+        number = int(str(value).strip())
+        if not low <= number <= high:
+            raise ValueError(f"{name} must be between {low} and {high}")
+        return number
+
+    count = integer(frame_count, GIF_DEFAULT_FRAME_COUNT, 2, 64, "frame_count")
+    duration = integer(frame_duration_ms, GIF_DEFAULT_FRAME_DURATION_MS, 20, 2000, "frame_duration_ms")
+    if duration % 10:
+        raise ValueError("frame_duration_ms must be a multiple of 10")
+    return fmt, count, duration
 
 
 def is_image_chat_request(body: dict[str, object]) -> bool:

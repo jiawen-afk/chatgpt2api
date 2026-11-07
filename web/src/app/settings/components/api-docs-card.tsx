@@ -105,6 +105,9 @@ const docs: ApiDoc[] = [
       ["n", "number", "可选，生成数量，当前限制 1-4。"],
       ["size", "string", "可选，图片尺寸。"],
       ["quality", "string", "可选，默认 auto。"],
+      ["output_format", "string", "png 或 gif，默认 png；图片编辑不支持 GIF。"],
+      ["frame_count", "number", "仅 GIF：2-64，默认 9。"],
+      ["frame_duration_ms", "number", "仅 GIF：20-2000 且为 10 的倍数，默认 200。"],
       ["response_format", "string", "可选，默认 b64_json。"],
     ],
     output: [

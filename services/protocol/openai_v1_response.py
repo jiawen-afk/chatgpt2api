@@ -441,6 +441,9 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         model=model,
         size=tool.get("size"),
         quality=str(tool.get("quality") or "auto"),
+        output_format=str(tool.get("output_format") or "png"),
+        frame_count=tool.get("frame_count"),
+        frame_duration_ms=tool.get("frame_duration_ms"),
         response_format="b64_json",
         images=images,
     ))

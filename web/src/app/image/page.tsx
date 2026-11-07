@@ -52,6 +52,9 @@ const ACTIVE_CONVERSATION_STORAGE_KEY = "chatgpt2api:image_active_conversation_i
 const IMAGE_RATIO_STORAGE_KEY = "chatgpt2api:image_last_ratio";
 const IMAGE_TIER_STORAGE_KEY = "chatgpt2api:image_last_tier";
 const IMAGE_QUALITY_STORAGE_KEY = "chatgpt2api:image_last_quality";
+const IMAGE_OUTPUT_FORMAT_STORAGE_KEY = "chatgpt2api:image_last_output_format";
+const IMAGE_FRAME_COUNT_STORAGE_KEY = "chatgpt2api:image_last_frame_count";
+const IMAGE_FRAME_DURATION_STORAGE_KEY = "chatgpt2api:image_last_frame_duration_ms";
 const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
 const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
 const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
@@ -170,8 +173,8 @@ function buildReferenceImageFromResult(image: StoredImage, fileName: string): St
 
   return {
     name: fileName,
-    type: "image/png",
-    dataUrl: `data:image/png;base64,${image.b64_json}`,
+    type: image.b64_json.startsWith("R0lGOD") ? "image/gif" : "image/png",
+    dataUrl: `data:${image.b64_json.startsWith("R0lGOD") ? "image/gif" : "image/png"};base64,${image.b64_json}`,
   };
 }
 
@@ -479,6 +482,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [imageWidth, setImageWidth] = useState("1024");
   const [imageHeight, setImageHeight] = useState("1024");
   const [imageQuality, setImageQuality] = useState("auto");
+  const [imageOutputFormat, setImageOutputFormat] = useState<"png" | "gif">("png");
+  const [frameCount, setFrameCount] = useState("9");
+  const [frameDurationMs, setFrameDurationMs] = useState("200");
   const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2");
   const [globalImageModel, setGlobalImageModel] = useState<ImageModel>("gpt-image-2");
   const [imageModels, setImageModels] = useState<ImageModel[]>(FALLBACK_IMAGE_MODELS);
@@ -635,6 +641,15 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       setImageWidth("1024");
       setImageHeight("1024");
       setImageQuality(storedQuality || "auto");
+      const storedOutputFormat =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_OUTPUT_FORMAT_STORAGE_KEY) : null;
+      const storedFrameCount =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_FRAME_COUNT_STORAGE_KEY) : null;
+      const storedFrameDuration =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_FRAME_DURATION_STORAGE_KEY) : null;
+      setImageOutputFormat(storedOutputFormat === "gif" ? "gif" : "png");
+      setFrameCount(storedFrameCount || "9");
+      setFrameDurationMs(storedFrameDuration || "200");
       setImageCount(storedCount ? clampImageCount(storedCount) : "1");
 
       const items = await listImageConversations();
@@ -883,8 +898,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     window.localStorage.setItem(IMAGE_RATIO_STORAGE_KEY, imageRatio);
     window.localStorage.setItem(IMAGE_TIER_STORAGE_KEY, imageTier);
     window.localStorage.setItem(IMAGE_QUALITY_STORAGE_KEY, imageQuality);
+    window.localStorage.setItem(IMAGE_OUTPUT_FORMAT_STORAGE_KEY, imageOutputFormat);
+    window.localStorage.setItem(IMAGE_FRAME_COUNT_STORAGE_KEY, frameCount);
+    window.localStorage.setItem(IMAGE_FRAME_DURATION_STORAGE_KEY, frameDurationMs);
     window.localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, imageModel);
-  }, [imageRatio, imageTier, imageQuality, imageModel]);
+  }, [imageRatio, imageTier, imageQuality, imageOutputFormat, frameCount, frameDurationMs, imageModel]);
 
   useEffect(() => {
     if (typeof window !== "undefined" && parsedCount > 0) {
@@ -1255,6 +1273,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setImageWidth(parsedSize.width);
     setImageHeight(parsedSize.height);
     setImageQuality(turn.quality);
+    setImageOutputFormat(turn.outputFormat === "gif" ? "gif" : "png");
+    setFrameCount(String(turn.frameCount || 9));
+    setFrameDurationMs(String(turn.frameDurationMs || 200));
     setImageModel(turn.model);
     setReferenceImages(turn.referenceImages);
     setMaskImages(turn.maskImages);
@@ -1358,7 +1379,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             const taskId = image.taskId || image.id;
             return activeTurn.mode === "edit"
               ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeMaskFiles)
-              : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality);
+              : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.outputFormat, activeTurn.frameCount, activeTurn.frameDurationMs);
           }),
         );
         await applyTasks(submitted);
@@ -1410,7 +1431,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
                 missingImages.map((image) =>
                   activeTurn.mode === "edit"
                     ? createImageEditTask(image.taskId || image.id, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeMaskFiles)
-                    : createImageGenerationTask(image.taskId || image.id, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality),
+                    : createImageGenerationTask(image.taskId || image.id, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.outputFormat, activeTurn.frameCount, activeTurn.frameDurationMs),
                 ),
               );
               if (resubmitted.length > 0) {
@@ -1491,6 +1512,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         ratio: sourceTurn.ratio,
         tier: sourceTurn.tier,
         quality: sourceTurn.quality,
+        outputFormat: sourceTurn.outputFormat,
+        frameCount: sourceTurn.frameCount,
+        frameDurationMs: sourceTurn.frameDurationMs,
         images: createLoadingImages(nextTurnId, count),
         createdAt: now,
         status: "queued",
@@ -1674,6 +1698,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     }
 
     const effectiveImageMode: ImageConversationMode = referenceImageFiles.length > 0 ? "edit" : "generate";
+    // 编辑链路不支持 GIF，带参考图时强制回落到 PNG。
+    const useGif = effectiveImageMode === "generate" && imageOutputFormat === "gif";
+    const parsedFrameCount = Math.min(64, Math.max(2, Math.round(Number(frameCount) || 9)));
+    const parsedFrameDuration = Math.min(2000, Math.max(20, Math.round((Number(frameDurationMs) || 200) / 10) * 10));
 
     const targetConversation = selectedConversationId
       ? conversationsRef.current.find((conversation) => conversation.id === selectedConversationId) ?? null
@@ -1694,6 +1722,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       ratio: imageRatio,
       tier: imageTier,
       quality: imageQuality,
+      outputFormat: useGif ? "gif" : "png",
+      frameCount: useGif ? parsedFrameCount : undefined,
+      frameDurationMs: useGif ? parsedFrameDuration : undefined,
       images: createLoadingImages(turnId, parsedCount),
       createdAt: now,
       status: "queued",
@@ -1853,6 +1884,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             imageWidth={imageWidth}
             imageHeight={imageHeight}
             imageQuality={imageQuality}
+            imageOutputFormat={imageOutputFormat}
+            frameCount={frameCount}
+            frameDurationMs={frameDurationMs}
             imageModel={imageModel}
             imageModels={imageModels}
             availableQuota={availableQuota}
@@ -1868,6 +1902,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             onImageWidthChange={setImageWidth}
             onImageHeightChange={setImageHeight}
             onImageQualityChange={setImageQuality}
+            onImageOutputFormatChange={setImageOutputFormat}
+            onFrameCountChange={setFrameCount}
+            onFrameDurationMsChange={setFrameDurationMs}
             onImageModelChange={(model) => void handleConversationModelChange(model)}
             onSubmit={handleSubmit}
             onPickReferenceImage={() => fileInputRef.current?.click()}

@@ -50,6 +50,13 @@ def _composite_mask(
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    if str(body.get("output_format") or "png").strip().lower() != "png":
+        raise ImageGenerationError(
+            "图片编辑暂不支持 GIF 输出，请改用 png",
+            status_code=400,
+            error_type="invalid_request_error",
+            code="invalid_image_output",
+        )
     prompt = str(body.get("prompt") or "")
     images = body.get("images") or []
     masks = body.get("mask") or []
