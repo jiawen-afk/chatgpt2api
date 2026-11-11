@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import re
 import threading
@@ -10,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
 import tiktoken
+from PIL import Image
 
 from services.account_service import account_service
 from services.config import config
@@ -22,9 +24,12 @@ from services.openai_backend_api import (
     TEXT_STREAM_TIMEOUT_SECS,
 )
 from utils.helper import (
+    GIF_IMAGE_TIMEOUT_SECS,
     extract_image_from_message_content,
     is_codex_image_model,
+    is_gif_bytes,
     is_supported_image_model,
+    normalize_image_output,
     split_image_model,
     supported_image_models,
     UpstreamHTTPError,
@@ -272,8 +277,20 @@ def assistant_history_messages(messages: list[dict[str, Any]]) -> list[str]:
     return [str(item.get("content") or "") for item in messages if item.get("role") == "assistant" and item.get("content")]
 
 
-def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> str:
+def build_image_prompt(
+    prompt: str,
+    size: str | None,
+    quality: str = "auto",
+    output_format: str = "png",
+    frame_count: int | None = None,
+    frame_duration_ms: int | None = None,
+) -> str:
     hints = []
+    # 网页生图没有 output_format 这类工具参数，只能靠提示词要求动图。
+    if output_format == "gif":
+        frames = f"{frame_count} 帧" if frame_count else "多帧"
+        duration = f"，每帧 {frame_duration_ms} 毫秒" if frame_duration_ms else ""
+        hints.append(f"输出可循环播放的动画 GIF（{frames}{duration}），不要输出静态图片。")
     if size:
         hints.append(f"输出图片尺寸为 {size}。")
     if quality:
@@ -320,6 +337,16 @@ def count_text_tokens(text: str, model: str) -> int:
     return len(encoding_for_model(model).encode(text))
 
 
+def image_bytes_format(payload: bytes) -> tuple[str, bool]:
+    """返回图片字节的真实 MIME 与是否动图，无法解析时按静态 PNG 处理。"""
+    try:
+        with Image.open(io.BytesIO(payload)) as image:
+            mime_type = Image.MIME.get(image.format or "", "image/png")
+            return mime_type, bool(getattr(image, "is_animated", False))
+    except Exception:
+        return "image/png", False
+
+
 def format_image_result(
     items: list[dict[str, Any]],
     prompt: str,
@@ -327,24 +354,41 @@ def format_image_result(
     base_url: str | None = None,
     created: int | None = None,
     message: str = "",
+    output_format: str = "png",
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     for item in items:
         b64_json = str(item.get("b64_json") or "").strip()
         if not b64_json:
             continue
+        image_bytes = base64.b64decode(b64_json)
+        # 上游按提示词可能直接回一段动图字节，落盘前先把真实格式和是否动图记下来，
+        # 客户端据此才能决定用 <img> 还是动图播放器。
+        mime_type, animated = image_bytes_format(image_bytes)
+        # 要 GIF 却拿到静态图时宁可报错，也不把 PNG 改名成 .gif 蒙混过去。
+        if output_format == "gif" and not (is_gif_bytes(image_bytes) and animated):
+            continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
             data.append({
                 "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(image_bytes, base_url),
+                "mime_type": mime_type,
+                "animated": animated,
                 "revised_prompt": revised_prompt,
             })
         else:
             data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(image_bytes, base_url),
+                "mime_type": mime_type,
+                "animated": animated,
                 "revised_prompt": revised_prompt,
             })
+    if output_format == "gif" and not data:
+        raise ImageGenerationError(
+            "上游没有返回动图（拿到的是静态图或单帧 GIF），请重试或改用 png",
+            code="output_format_mismatch",
+        )
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
         result["message"] = message
@@ -361,6 +405,9 @@ class ConversationRequest:
     n: int = 1
     size: str | None = None
     quality: str = "auto"
+    output_format: str = "png"
+    frame_count: int | None = None
+    frame_duration_ms: int | None = None
     response_format: str = "b64_json"
     base_url: str | None = None
     message_as_error: bool = False
@@ -975,12 +1022,19 @@ def conversation_events(
     size: str | None = None,
     quality: str = "auto",
     thinking_effort: str = "",
+    output_format: str = "png",
+    frame_count: int | None = None,
+    frame_duration_ms: int | None = None,
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
-    final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
+    final_prompt = (
+        prompt_with_global_system(build_image_prompt(prompt, size, quality, output_format, frame_count, frame_duration_ms))
+        if image_model
+        else prompt
+    )
     payloads = backend.stream_conversation(
         messages=normalized,
         model=model,
@@ -1158,6 +1212,9 @@ def stream_image_outputs(
             images=request.images or [],
             size=request.size,
             quality=request.quality,
+            output_format=request.output_format,
+            frame_count=request.frame_count,
+            frame_duration_ms=request.frame_duration_ms,
     ):
         last = event
         if event.get("type") == "conversation.delta":
@@ -1316,6 +1373,7 @@ def stream_image_outputs(
             request.response_format,
             request.base_url,
             int(time.time()),
+            output_format=request.output_format,
         )["data"]
         if data:
             _remove_image_conversation_later(backend, conversation_id)
@@ -1416,6 +1474,7 @@ def stream_image_outputs(
                         request.response_format,
                         request.base_url,
                         int(time.time()),
+                        output_format=request.output_format,
                     )["data"]
                     if data:
                         _remove_image_conversation_later(backend, conversation_id)
@@ -1531,6 +1590,7 @@ def stream_image_outputs(
                     request.response_format,
                     request.base_url,
                     int(time.time()),
+                    output_format=request.output_format,
                 )["data"]
                 if data:
                     _remove_image_conversation_later(backend, conversation_id)
@@ -1583,6 +1643,9 @@ def stream_codex_image_outputs(
         images=request.images or [],
         size=request.size,
         quality=request.quality,
+        output_format=request.output_format,
+        frame_count=request.frame_count,
+        frame_duration_ms=request.frame_duration_ms,
     )))
     if not images:
         raise ImageGenerationError("No image result found in response")
@@ -1592,6 +1655,7 @@ def stream_codex_image_outputs(
         request.response_format,
         request.base_url,
         int(time.time()),
+        output_format=request.output_format,
     )["data"]
     if data:
         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)
@@ -1626,13 +1690,17 @@ def _generate_single_image(
     poll_timeout_retry_count = 0
     concurrency_retry_count = 0
     account_email = ""
-    request_deadline = time.monotonic() + float(config.image_poll_timeout_secs)
+    # 动图是逐帧生成，沿用静态图的 120 秒会在最后一帧前被掐断。
+    image_timeout_secs = float(config.image_poll_timeout_secs)
+    if request.output_format == "gif":
+        image_timeout_secs = max(image_timeout_secs, GIF_IMAGE_TIMEOUT_SECS)
+    request_deadline = time.monotonic() + image_timeout_secs
 
     while True:
         remaining_before_attempt = request_deadline - time.monotonic()
         if remaining_before_attempt <= 0:
             raise ImagePollTimeoutError(
-                f"ChatGPT 生图超时（已等待 {config.image_poll_timeout_secs} 秒）。"
+                f"ChatGPT 生图超时（已等待 {image_timeout_secs:g} 秒）。"
                 f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
                 f"也可能是账号被限流或生图队列拥堵导致。"
             )
@@ -1665,6 +1733,7 @@ def _generate_single_image(
         try:
             backend = OpenAIBackendAPI(access_token=token)
             backend.image_request_deadline = request_deadline
+            backend.image_timeout_secs = image_timeout_secs
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1863,6 +1932,18 @@ def _generate_single_image(
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
+    try:
+        request.output_format, request.frame_count, request.frame_duration_ms = normalize_image_output(
+            request.output_format, request.frame_count, request.frame_duration_ms
+        )
+    except ValueError as exc:
+        raise ImageGenerationError(
+            str(exc), status_code=400, error_type="invalid_request_error", code="invalid_image_output"
+        ) from exc
+    if request.output_format == "gif" and request.images:
+        raise ImageGenerationError(
+            "图片编辑暂不支持 GIF 输出，请改用 png", status_code=400, code="invalid_image_output"
+        )
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(supported_image_models())))
 

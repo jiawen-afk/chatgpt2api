@@ -18,6 +18,9 @@ type ImageComposerProps = {
   imageWidth: string;
   imageHeight: string;
   imageQuality: string;
+  imageOutputFormat: "png" | "gif";
+  frameCount: string;
+  frameDurationMs: string;
   imageModel: ImageModel;
   imageModels: ImageModel[];
   availableQuota: string;
@@ -33,6 +36,9 @@ type ImageComposerProps = {
   onImageWidthChange: (value: string) => void;
   onImageHeightChange: (value: string) => void;
   onImageQualityChange: (value: string) => void;
+  onImageOutputFormatChange: (value: "png" | "gif") => void;
+  onFrameCountChange: (value: string) => void;
+  onFrameDurationMsChange: (value: string) => void;
   onImageModelChange: (value: ImageModel) => void;
   onSubmit: () => void | Promise<void>;
   onPickReferenceImage: () => void;
@@ -92,6 +98,9 @@ export function ImageComposer({
   imageWidth,
   imageHeight,
   imageQuality,
+  imageOutputFormat,
+  frameCount,
+  frameDurationMs,
   imageModel,
   imageModels,
   availableQuota,
@@ -107,6 +116,9 @@ export function ImageComposer({
   onImageWidthChange,
   onImageHeightChange,
   onImageQualityChange,
+  onImageOutputFormatChange,
+  onFrameCountChange,
+  onFrameDurationMsChange,
   onImageModelChange,
   onSubmit,
   onPickReferenceImage,
@@ -134,7 +146,10 @@ export function ImageComposer({
   );
   const qualityLabel = qualityOptions.find((option) => option.value === imageQuality)?.label || "自动";
   const ratioLabel = imageRatio === "auto" ? "auto" : `${imageRatio}(${imageTier})`;
-  const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${imageCount || 1} 张`;
+  // 带参考图时走编辑链路，上游不支持 GIF，这里直接禁掉而不是发出去再报错。
+  const gifDisabled = referenceImages.length > 0;
+  const activeOutputFormat = gifDisabled ? "png" : imageOutputFormat;
+  const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${imageCount || 1} 张${activeOutputFormat === "gif" ? " · GIF" : ""}`;
   const selectedModelLabel = modelOptions.find((option) => option.value === imageModel)?.label || imageModel;
   const isCodexModel = imageModel.toLowerCase().includes("codex");
   const supportsExtendedQuality = imageModel.toLowerCase().includes("image-2.5");
@@ -458,6 +473,59 @@ export function ImageComposer({
                               );
                             })}
                           </div>
+                        </div>
+                        <div className="mb-3">
+                          <div className="mb-2 text-sm font-medium text-stone-900">格式</div>
+                          <div className="grid grid-cols-2 gap-2">
+                            {(["png", "gif"] as const).map((format) => {
+                              const active = format === activeOutputFormat;
+                              const disabled = format === "gif" && gifDisabled;
+                              return (
+                                <button
+                                  key={format}
+                                  type="button"
+                                  disabled={disabled}
+                                  className={cn(
+                                    "h-9 cursor-pointer rounded-full border border-stone-200 bg-white text-sm text-stone-800 transition hover:border-stone-300 hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-40",
+                                    active && "border-stone-950 bg-white font-medium text-stone-950",
+                                  )}
+                                  onClick={() => onImageOutputFormatChange(format)}
+                                >
+                                  {format === "gif" ? "GIF" : "PNG"}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          {activeOutputFormat === "gif" ? (
+                            <div className="mt-2 grid grid-cols-2 gap-2">
+                              <label className="flex items-center gap-2 rounded-lg bg-stone-100 px-3 py-1.5 text-sm text-stone-700">
+                                <span className="shrink-0 text-stone-500">帧</span>
+                                <Input
+                                  type="number"
+                                  min="2"
+                                  max="64"
+                                  value={frameCount}
+                                  onChange={(event) => onFrameCountChange(event.target.value)}
+                                  className="h-7 border-0 bg-transparent px-0 text-sm font-medium text-stone-800 shadow-none focus-visible:ring-0"
+                                />
+                              </label>
+                              <label className="flex items-center gap-2 rounded-lg bg-stone-100 px-3 py-1.5 text-sm text-stone-700">
+                                <span className="shrink-0 text-stone-500">毫秒</span>
+                                <Input
+                                  type="number"
+                                  min="20"
+                                  max="2000"
+                                  step="10"
+                                  value={frameDurationMs}
+                                  onChange={(event) => onFrameDurationMsChange(event.target.value)}
+                                  className="h-7 border-0 bg-transparent px-0 text-sm font-medium text-stone-800 shadow-none focus-visible:ring-0"
+                                />
+                              </label>
+                            </div>
+                          ) : null}
+                          {gifDisabled ? (
+                            <p className="mt-2 text-xs text-stone-500">带参考图的编辑暂不支持 GIF。</p>
+                          ) : null}
                         </div>
                         <div className="mb-3">
                           <div className="mb-2 flex items-center gap-1.5 text-sm font-medium text-stone-900">

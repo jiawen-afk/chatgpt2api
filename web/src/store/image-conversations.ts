@@ -42,6 +42,9 @@ export type ImageTurn = {
   ratio: string;
   tier: string;
   quality: string;
+  outputFormat?: "png" | "gif";
+  frameCount?: number;
+  frameDurationMs?: number;
   images: StoredImage[];
   createdAt: string;
   status: ImageTurnStatus;

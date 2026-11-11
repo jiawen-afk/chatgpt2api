@@ -216,6 +216,9 @@ curl http://localhost:8000/v1/images/generations \
 | `model`           | 图片模型，当前可用值以 `/v1/models` 返回结果为准，推荐使用 `gpt-image-2` |
 | `prompt`          | 图片生成提示词                                            |
 | `n`               | 生成数量，当前后端限制为 `1-4`                                 |
+| `output_format`   | `png`（默认）或 `gif`；图片编辑与带参考图的链路不支持 GIF              |
+| `frame_count`     | 仅 GIF：帧数 `2-64`，默认 `9`                              |
+| `frame_duration_ms` | 仅 GIF：每帧时长 `20-2000` 且为 `10` 的倍数，默认 `200`          |
 | `response_format` | 当前请求模型中包含该字段，默认值为 `b64_json`                       |
 
 <br>
