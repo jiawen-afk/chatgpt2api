@@ -163,6 +163,9 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
     ratio: typeof turn.ratio === "string" && turn.ratio ? turn.ratio : "1:1",
     tier: typeof turn.tier === "string" && turn.tier ? turn.tier : "1k",
     quality: typeof turn.quality === "string" && turn.quality ? turn.quality : "auto",
+    outputFormat: turn.outputFormat === "gif" ? "gif" : "png",
+    frameCount: turn.outputFormat === "gif" ? Number(turn.frameCount || 9) : undefined,
+    frameDurationMs: turn.outputFormat === "gif" ? Number(turn.frameDurationMs || 200) : undefined,
     images: normalizedImages,
     createdAt: String(turn.createdAt || new Date().toISOString()),
     status:
